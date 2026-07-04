@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-korea-daily-news-digest (무료 버전)
-- Google News(한국) RSS로 뉴스 수집 → 주제별로 정리 → 텔레그램/파일 전달
-- Claude API 미사용 = 과금 없음. (LLM 요약 대신 헤드라인 목록 정리)
+korea-daily-news-digest (분야별 · 무료 버전)
+- 분야별로 Google News(한국) RSS 검색 → 신뢰 언론사 우선 정렬 → 텔레그램/파일 전달
+- Claude API 미사용 = 과금 없음.
 
 필요 패키지:  pip install feedparser requests
 환경변수(.env):
-  TELEGRAM_BOT_TOKEN  (선택 - 있으면 텔레그램 전송)
-  TELEGRAM_CHAT_ID    (선택)
-  NEWS_KEYWORDS       (선택 - 쉼표구분. 비우면 종합 헤드라인)
-                      예: "코스피,비트코인,인디게임"
-  MAX_PER_TOPIC       (선택 - 주제당 기사 수, 기본 5)
+  TELEGRAM_BOT_TOKEN   (선택 - 있으면 텔레그램 전송)
+  TELEGRAM_CHAT_ID     (선택)
+  NEWS_CATEGORIES      (선택 - 쉼표구분. 비우면 아래 기본 7개 분야)
+  MAX_PER_CATEGORY     (선택 - 분야당 기사 수, 기본 5)
+  RECENCY_DAYS         (선택 - 최근 며칠 기사만, 기본 2 = 오늘~어제)
 """
 
 import os
@@ -27,22 +27,43 @@ GNEWS_BASE = "https://news.google.com/rss"
 LOCALE = "hl=ko&gl=KR&ceid=KR:ko"
 OUT_DIR = os.path.expanduser("~/korea-daily-news-digest/archive")
 
+# 기본 분야 (이모지, 검색어) — 순서가 곧 출력 순서
+DEFAULT_CATEGORIES = [
+    ("정치", "🏛️"),
+    ("경제", "💹"),
+    ("사회", "🏙️"),
+    ("문화", "🎨"),
+    ("과학", "🔬"),
+    ("스포츠", "⚽"),
+    ("연예", "🎬"),
+]
 
-# ---------- 1. 뉴스 수집 ----------
+# 신뢰 언론사 (앞쪽일수록 우선)
+TRUSTED = ["연합뉴스", "조선일보", "중앙일보", "동아일보",
+           "KBS", "MBC", "SBS", "한겨레", "경향신문"]
+
+
+def _rank(src):
+    return TRUSTED.index(src) if src in TRUSTED else len(TRUSTED)
+
+
+# ---------- 1. 분야별 수집 ----------
 def fetch_news():
-    max_per = int(os.getenv("MAX_PER_TOPIC", "5"))
-    keywords = [k.strip() for k in os.getenv("NEWS_KEYWORDS", "").split(",") if k.strip()]
+    max_per = int(os.getenv("MAX_PER_CATEGORY", "5"))
+    recency = int(os.getenv("RECENCY_DAYS", "2"))
 
-    topics = keywords if keywords else ["주요뉴스"]
+    env_cats = [c.strip() for c in os.getenv("NEWS_CATEGORIES", "").split(",") if c.strip()]
+    if env_cats:
+        categories = [(c, "📌") for c in env_cats]
+    else:
+        categories = DEFAULT_CATEGORIES
+
     groups = OrderedDict()
-
-    for topic in topics:
-        if topic == "주요뉴스":
-            url = f"{GNEWS_BASE}?{LOCALE}"
-        else:
-            url = f"{GNEWS_BASE}/search?q={requests.utils.quote(topic)}&{LOCALE}"
-
+    for name, emoji in categories:
+        query = f"{name} when:{recency}d"
+        url = f"{GNEWS_BASE}/search?q={requests.utils.quote(query)}&{LOCALE}"
         feed = feedparser.parse(url)
+
         items, seen = [], set()
         for e in feed.entries:
             title = html.unescape(getattr(e, "title", "")).strip()
@@ -52,21 +73,22 @@ def fetch_news():
             src = e["source"].get("title", "") if e.get("source") else ""
             clean = title.rsplit(" - ", 1)[0] if src and title.endswith(f" - {src}") else title
             items.append({"title": clean, "source": src, "link": getattr(e, "link", "")})
-            if len(items) >= max_per:
-                break
+
+        # 신뢰 언론사 우선 정렬 후 상위 N개
+        items.sort(key=lambda a: _rank(a["source"]))
         if items:
-            groups[topic] = items
+            groups[(name, emoji)] = items[:max_per]
 
     return groups
 
 
-# ---------- 2. 정리 (LLM 없이 포맷팅만) ----------
+# ---------- 2. 정리 ----------
 def build_digest(groups):
     if not groups:
         return "오늘 수집된 뉴스가 없습니다."
     lines = []
-    for topic, items in groups.items():
-        lines.append(f"\n■ {topic}")
+    for (name, emoji), items in groups.items():
+        lines.append(f"\n{emoji} {name}")
         for a in items:
             src = f" ({a['source']})" if a["source"] else ""
             lines.append(f"  · {a['title']}{src}")
@@ -94,7 +116,9 @@ def deliver(text):
                 data={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
                 timeout=30,
             )
-            r.raise_for_status()
+            if not r.ok:
+                # 텔레그램 실제 에러 메시지 노출
+                raise RuntimeError(f"Telegram {r.status_code}: {r.text}")
         print(f"[OK] 텔레그램 전송 완료 · 백업: {path}")
     else:
         print(f"[OK] 파일 저장: {path}  (텔레그램 미설정 → 전송 생략)")
@@ -105,7 +129,7 @@ def main():
     try:
         groups = fetch_news()
         total = sum(len(v) for v in groups.values())
-        print(f"[INFO] {len(groups)}개 주제 · 뉴스 {total}건 수집")
+        print(f"[INFO] {len(groups)}개 분야 · 뉴스 {total}건 수집")
         deliver(build_digest(groups))
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
