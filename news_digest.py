@@ -3,6 +3,7 @@
 korea-daily-news-digest (분야별 · 무료 버전)
 - 분야별로 Google News(한국) RSS 검색 → 신뢰 언론사 우선 정렬 → 텔레그램/파일 전달
 - Claude API 미사용 = 과금 없음.
+- 링크는 제목에 하이퍼링크로 걸어 메시지를 깔끔하게 유지.
 
 필요 패키지:  pip install feedparser requests
 환경변수(.env):
@@ -27,7 +28,7 @@ GNEWS_BASE = "https://news.google.com/rss"
 LOCALE = "hl=ko&gl=KR&ceid=KR:ko"
 OUT_DIR = os.path.expanduser("~/korea-daily-news-digest/archive")
 
-# 기본 분야 (이모지, 검색어) — 순서가 곧 출력 순서
+# 기본 분야 (분야명, 이모지) — 순서가 곧 출력 순서
 DEFAULT_CATEGORIES = [
     ("정치", "🏛️"),
     ("경제", "💹"),
@@ -53,10 +54,7 @@ def fetch_news():
     recency = int(os.getenv("RECENCY_DAYS", "2"))
 
     env_cats = [c.strip() for c in os.getenv("NEWS_CATEGORIES", "").split(",") if c.strip()]
-    if env_cats:
-        categories = [(c, "📌") for c in env_cats]
-    else:
-        categories = DEFAULT_CATEGORIES
+    categories = [(c, "📌") for c in env_cats] if env_cats else DEFAULT_CATEGORIES
 
     groups = OrderedDict()
     for name, emoji in categories:
@@ -74,55 +72,93 @@ def fetch_news():
             clean = title.rsplit(" - ", 1)[0] if src and title.endswith(f" - {src}") else title
             items.append({"title": clean, "source": src, "link": getattr(e, "link", "")})
 
-        # 신뢰 언론사 우선 정렬 후 상위 N개
-        items.sort(key=lambda a: _rank(a["source"]))
+        items.sort(key=lambda a: _rank(a["source"]))  # 신뢰 언론사 우선
         if items:
             groups[(name, emoji)] = items[:max_per]
 
     return groups
 
 
-# ---------- 2. 정리 ----------
-def build_digest(groups):
-    if not groups:
-        return "오늘 수집된 뉴스가 없습니다."
-    lines = []
+# ---------- 2. 렌더링 ----------
+def render_html(groups):
+    """텔레그램용: 제목에 링크 임베드 (URL 숨김)"""
+    L = []
     for (name, emoji), items in groups.items():
-        lines.append(f"\n{emoji} {name}")
+        L.append(f"\n{emoji} <b>{name}</b>")
+        for a in items:
+            t = html.escape(a["title"])
+            src = f" ({html.escape(a['source'])})" if a["source"] else ""
+            if a["link"]:
+                u = html.escape(a["link"], quote=True)
+                L.append(f'  · <a href="{u}">{t}</a>{src}')
+            else:
+                L.append(f"  · {t}{src}")
+    return L
+
+
+def render_md(groups):
+    """파일 백업용: 마크다운 링크"""
+    L = []
+    for (name, emoji), items in groups.items():
+        L.append(f"\n{emoji} {name}")
         for a in items:
             src = f" ({a['source']})" if a["source"] else ""
-            lines.append(f"  · {a['title']}{src}")
             if a["link"]:
-                lines.append(f"    {a['link']}")
-    return "\n".join(lines).strip()
+                L.append(f"  · [{a['title']}]({a['link']}){src}")
+            else:
+                L.append(f"  · {a['title']}{src}")
+    return L
+
+
+def _chunk_lines(lines, limit=3800):
+    out, cur = [], ""
+    for ln in lines:
+        if cur and len(cur) + len(ln) + 1 > limit:
+            out.append(cur)
+            cur = ln
+        else:
+            cur = f"{cur}\n{ln}" if cur else ln
+    if cur:
+        out.append(cur)
+    return out
 
 
 # ---------- 3. 전달 ----------
-def deliver(text):
+def deliver(groups):
     today = datetime.date.today().isoformat()
-    body = f"📰 오늘의 뉴스 ({today})\n{text}"
+    header = f"📰 오늘의 뉴스 ({today})"
+
+    if not groups:
+        body_md = header + "\n오늘 수집된 뉴스가 없습니다."
+    else:
+        body_md = header + "\n" + "\n".join(render_md(groups))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     path = os.path.join(OUT_DIR, f"{today}.md")
     with open(path, "w", encoding="utf-8") as f:
-        f.write(body)
+        f.write(body_md)
 
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if token and chat_id:
-        for chunk in [body[i:i + 3800] for i in range(0, len(body), 3800)]:
+        html_lines = [header] + (render_html(groups) if groups else ["오늘 수집된 뉴스가 없습니다."])
+        for chunk in _chunk_lines(html_lines):
             r = requests.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
-                data={"chat_id": chat_id, "text": chunk, "disable_web_page_preview": True},
+                data={
+                    "chat_id": chat_id,
+                    "text": chunk,
+                    "parse_mode": "HTML",
+                    "disable_web_page_preview": True,
+                },
                 timeout=30,
             )
             if not r.ok:
-                # 텔레그램 실제 에러 메시지 노출
                 raise RuntimeError(f"Telegram {r.status_code}: {r.text}")
         print(f"[OK] 텔레그램 전송 완료 · 백업: {path}")
     else:
         print(f"[OK] 파일 저장: {path}  (텔레그램 미설정 → 전송 생략)")
-        print("\n" + body)
+        print("\n" + body_md)
 
 
 def main():
@@ -130,7 +166,7 @@ def main():
         groups = fetch_news()
         total = sum(len(v) for v in groups.values())
         print(f"[INFO] {len(groups)}개 분야 · 뉴스 {total}건 수집")
-        deliver(build_digest(groups))
+        deliver(groups)
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
         sys.exit(1)
